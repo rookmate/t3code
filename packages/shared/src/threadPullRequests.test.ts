@@ -270,6 +270,25 @@ describe("resolveThreadPullRequestChains", () => {
     ]);
   });
 
+  it("nests every pull request built on the same one under it", () => {
+    // 2 and 3 both build on 1; 4 and 5 both build on 2, so they come before 3.
+    const chains = resolveThreadPullRequestChains([
+      link(3, { snapshot: snapshot({ headBranch: "c", baseBranch: "a" }) }),
+      link(1, { snapshot: snapshot({ headBranch: "a", baseBranch: "main" }) }),
+      link(5, { snapshot: snapshot({ headBranch: "e", baseBranch: "b" }) }),
+      link(2, { snapshot: snapshot({ headBranch: "b", baseBranch: "a" }) }),
+      link(4, { snapshot: snapshot({ headBranch: "d", baseBranch: "b" }) }),
+    ]);
+    expect(
+      chains.map((chain) => [chain.layers.map((layer) => layer.number), chain.depths]),
+    ).toEqual([
+      [
+        [1, 2, 4, 5, 3],
+        [0, 1, 2, 2, 1],
+      ],
+    ]);
+  });
+
   it("uses the native stack order when the host provides one", () => {
     const stack = {
       kind: "native" as const,
@@ -353,6 +372,40 @@ describe("chain selection and badge state", () => {
       });
     },
   );
+
+  it("points a branching stack at its newest-linked open tip, or its latest-updated tip once done", () => {
+    // 2 and 3 both build on 1, and 4 builds on 2. 4 was linked last, though 3 sorts after it.
+    const links = [
+      link(1, { snapshot: snapshot({ headBranch: "a" }) }),
+      link(2, { snapshot: snapshot({ headBranch: "b", baseBranch: "a" }) }),
+      link(3, { snapshot: snapshot({ headBranch: "c", baseBranch: "a" }) }),
+      link(4, { snapshot: snapshot({ headBranch: "d", baseBranch: "b" }) }),
+    ];
+    const merged = (entry: ThreadPullRequestLink) => ({
+      ...entry,
+      snapshot: { ...entry.snapshot!, state: "merged" as const },
+    });
+    expect(resolveThreadCurrentPullRequest(links)).toMatchObject({
+      kind: "stack",
+      top: { number: 4 },
+    });
+    // With 4 merged, 2 is a tip again, but 3 was linked after it.
+    expect(
+      resolveThreadCurrentPullRequest([links[0]!, links[1]!, links[2]!, merged(links[3]!)]),
+    ).toMatchObject({ kind: "stack", top: { number: 3 } });
+    // Finished, it points at the tip updated last: 3, though 4 was linked after it.
+    const finished = links
+      .map(merged)
+      .map((entry) =>
+        entry.number === 3
+          ? { ...entry, snapshot: { ...entry.snapshot, updatedAt: "2026-03-01T00:00:00.000Z" } }
+          : entry,
+      );
+    expect(resolveThreadCurrentPullRequest(finished)).toMatchObject({
+      kind: "single",
+      link: { number: 3 },
+    });
+  });
 
   it("keeps the top native layer after completion and treats an unsynced layer as open", () => {
     const stack = {

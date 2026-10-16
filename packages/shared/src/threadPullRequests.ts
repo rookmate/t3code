@@ -103,13 +103,47 @@ export type ThreadCurrentPullRequest =
   | {
       readonly kind: "stack";
       readonly open: ReadonlyArray<ThreadPullRequestLink>;
-      /** Highest layer of the open set; the one "View PR" and copy-link target. */
+      /**
+       * The most recently linked open tip of the chain holding the most recently linked open
+       * pull request; the one "View PR" and copy-link target.
+       */
       readonly top: ThreadPullRequestLink;
     };
 
+function linkedAtMs(link: ThreadPullRequestLink): number {
+  const ms = Date.parse(link.linkedAt);
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
 /**
- * Prefer open work and the highest open layer within a chain. A completed chain still
- * points at its top; unrelated terminal links use the most recently updated request.
+ * The layer a chain shows in one slot: of the matching layers that no other matching layer
+ * builds on, the most recent by `recency`. A straight stack has one such layer, its highest.
+ */
+function chainTip(
+  chain: ThreadPullRequestChain,
+  matches: (link: ThreadPullRequestLink) => boolean,
+  recency: (link: ThreadPullRequestLink) => number,
+): ThreadPullRequestLink | undefined {
+  let tip: ThreadPullRequestLink | undefined;
+  chain.layers.forEach((link, index) => {
+    if (!matches(link)) return;
+    // Layers build on this one for as long as the ones after it sit deeper.
+    for (
+      let next = index + 1;
+      next < chain.layers.length && chain.depths[next]! > chain.depths[index]!;
+      next++
+    ) {
+      if (matches(chain.layers[next]!)) return;
+    }
+    if (tip === undefined || recency(link) >= recency(tip)) tip = link;
+  });
+  return tip;
+}
+
+/**
+ * Prefer open work: the chain linked to most recently, then its most recently linked open tip.
+ * A completed chain points at its most recently updated tip, which for a straight stack is its
+ * top; unrelated terminal links use the most recently updated request.
  */
 export function resolveThreadCurrentPullRequest(
   links: ReadonlyArray<ThreadPullRequestLink>,
@@ -123,7 +157,13 @@ export function resolveThreadCurrentPullRequest(
     // `.reverse()` on a copy, not `.toReversed()`: this runs on Hermes, which has no ES2023
     // array methods, and a TypeError here is fatal on every mobile launch that renders a stack.
     const openChains = chains
-      .map((chain) => [...chain.layers].reverse().filter(isOpen))
+      .map((chain) => {
+        const tip = chainTip(chain, isOpen, linkedAtMs);
+        // The tip leads so it is the `top` when this chain sorts first.
+        return tip === undefined
+          ? []
+          : [tip, ...[...chain.layers].reverse().filter((link) => link !== tip && isOpen(link))];
+      })
       .filter((layers) => layers.length > 0)
       .sort(
         (left, right) =>
@@ -134,7 +174,7 @@ export function resolveThreadCurrentPullRequest(
     return { kind: "stack", open: ordered, top: ordered[0]! };
   }
   if (chains.length === 1) {
-    return { kind: "single", link: chains[0]!.layers.at(-1)! };
+    return { kind: "single", link: chainTip(chains[0]!, () => true, latestUpdatedAt)! };
   }
   const terminal = [...visible].sort(
     (left, right) => latestUpdatedAt(right) - latestUpdatedAt(left),
@@ -204,14 +244,20 @@ export function legacyLinkedPullRequestOf(
 
 export interface ThreadPullRequestChain {
   readonly kind: "native" | "derived";
-  /** Bottom to top. */
+  /**
+   * Bottom to top. A derived chain can branch: each layer comes right after the one it builds
+   * on, followed by everything built on it, and siblings come in ascending number.
+   */
   readonly layers: ReadonlyArray<ThreadPullRequestLink>;
+  /** How many layers each entry of `layers` sits above the bottom; siblings share a depth. */
+  readonly depths: ReadonlyArray<number>;
 }
 
 /**
  * Groups a thread's links into stacks. Native stacks come from the host and win; the rest
  * are chained by matching one link's base branch to another's head branch within the same
- * repository. A link that chains to nothing is a one-layer chain.
+ * repository, so several links built on one pull request share its stack. A link that
+ * chains to nothing is a one-layer chain.
  */
 export function resolveThreadPullRequestChains(
   links: ReadonlyArray<ThreadPullRequestLink>,
@@ -233,7 +279,7 @@ export function resolveThreadPullRequestChains(
     const order = new Map(members[0]!.stack!.layers.map((layer, index) => [layer.number, index]));
     members.sort((left, right) => (order.get(left.number) ?? 0) - (order.get(right.number) ?? 0));
     for (const member of members) placed.add(threadPullRequestKeyOf(member));
-    chains.push({ kind: "native", layers: members });
+    chains.push({ kind: "native", layers: members, depths: members.map((_, index) => index) });
   }
 
   const remaining = visible.filter((link) => !placed.has(threadPullRequestKeyOf(link)));
@@ -248,31 +294,45 @@ export function resolveThreadPullRequestChains(
     const key = branchKey(link, link.snapshot.headBranch);
     byHead.set(key, byHead.has(key) ? null : link);
   }
-  const hasChild = new Set<string>();
-  for (const link of remaining) {
-    if (link.snapshot === null) continue;
+  const parentOf = (link: ThreadPullRequestLink) => {
+    if (link.snapshot === null) return undefined;
     const parent = byHead.get(branchKey(link, link.snapshot.baseBranch));
-    if (parent != null && parent !== link) hasChild.add(threadPullRequestKeyOf(parent));
+    return parent == null || parent === link ? undefined : parent;
+  };
+  const children = new Map<ThreadPullRequestLink, Array<ThreadPullRequestLink>>();
+  for (const link of remaining) {
+    const parent = parentOf(link);
+    if (parent === undefined) continue;
+    const siblings = children.get(parent) ?? [];
+    siblings.push(link);
+    children.set(parent, siblings);
   }
-  // Walk from each top (a link nothing builds on) down its base chain.
-  for (const top of remaining) {
-    if (hasChild.has(threadPullRequestKeyOf(top))) continue;
+  // Walk up from each bottom (a link built on nothing here), depth first, so every layer
+  // follows the one it builds on, together with everything built on it.
+  for (const bottom of remaining) {
+    if (parentOf(bottom) !== undefined) continue;
     const layers: Array<ThreadPullRequestLink> = [];
-    let cursor: ThreadPullRequestLink | undefined = top;
-    while (cursor !== undefined && !placed.has(threadPullRequestKeyOf(cursor))) {
-      placed.add(threadPullRequestKeyOf(cursor));
-      layers.unshift(cursor);
-      cursor =
-        cursor.snapshot === null
-          ? undefined
-          : (byHead.get(branchKey(cursor, cursor.snapshot.baseBranch)) ?? undefined);
+    const depths: Array<number> = [];
+    const pending = [{ link: bottom, depth: 0 }];
+    while (pending.length > 0) {
+      const { link, depth } = pending.pop()!;
+      if (placed.has(threadPullRequestKeyOf(link))) continue;
+      placed.add(threadPullRequestKeyOf(link));
+      layers.push(link);
+      depths.push(depth);
+      // Highest number pushed first, so siblings come off the stack lowest number first.
+      const next = [...(children.get(link) ?? [])].sort(
+        (left, right) => right.number - left.number,
+      );
+      for (const child of next) pending.push({ link: child, depth: depth + 1 });
     }
-    if (layers.length > 0) chains.push({ kind: "derived", layers });
+    if (layers.length > 0) chains.push({ kind: "derived", layers, depths });
   }
-  // Cycles have no top. Keep those links visible without inventing a stack order.
+  // Cycles have no bottom. Keep those links, and any built on them, visible without
+  // inventing a stack order.
   for (const link of remaining) {
     if (!placed.has(threadPullRequestKeyOf(link))) {
-      chains.push({ kind: "derived", layers: [link] });
+      chains.push({ kind: "derived", layers: [link], depths: [0] });
     }
   }
   return chains;
